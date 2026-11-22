@@ -1,0 +1,1 @@
+Run `cargo build` and report any errors. If there are compilation errors, fix them one crate at a time starting from the lowest-level crate (domain → storage → scheduler → ui → app). After fixing, run `cargo build` again to confirm clean.
