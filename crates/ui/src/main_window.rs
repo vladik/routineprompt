@@ -6,7 +6,7 @@ use gpui::{
     WindowOptions, div, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use storage::ReminderStore;
 use uuid::Uuid;
 
@@ -43,6 +43,8 @@ pub struct MainWindow {
     form_min_dismissal: bool,
     form_min_dismissal_mins: u8,
     form_scroll: ScrollHandle,
+    // File picker result arrives here from a background thread; polled in render().
+    pending_file_pick: Option<(mpsc::Receiver<Option<PathBuf>>, AssetKind, Option<usize>)>,
 }
 
 impl MainWindow {
@@ -79,6 +81,7 @@ impl MainWindow {
             form_min_dismissal: false,
             form_min_dismissal_mins: 2,
             form_scroll: ScrollHandle::new(),
+            pending_file_pick: None,
         }
     }
 
@@ -242,6 +245,38 @@ impl MainWindow {
         let _ = self.store.delete(id);
         self.sync_shared();
         cx.notify();
+    }
+
+    fn apply_file_pick(&mut self, src: PathBuf, kind: AssetKind, slot: Option<usize>, cx: &mut Context<Self>) {
+        let ext = src.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_lowercase();
+        let asset_id = Uuid::new_v4();
+        let filename = format!("{}.{}", asset_id, ext);
+        let dest = self.assets_dir.join(&filename);
+        if std::fs::copy(&src, &dest).is_ok() {
+            let name = src.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Asset")
+                .to_string();
+            let asset = domain::MediaAsset {
+                id: asset_id,
+                name,
+                kind,
+                filename,
+                created_at: chrono::Utc::now(),
+            };
+            let _ = self.store.upsert_asset(&asset);
+            self.assets = self.store.list_assets().unwrap_or_default();
+            if let Some(s) = slot {
+                self.form_image_ids[s] = Some(asset_id);
+            } else {
+                self.form_sound_id = Some(asset_id);
+            }
+            self.mode = Mode::Form;
+            cx.notify();
+        }
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1026,8 +1061,6 @@ impl MainWindow {
             .cloned()
             .collect();
 
-        let assets_dir = self.assets_dir.clone();
-
         div()
             .size_full()
             .flex()
@@ -1078,51 +1111,30 @@ impl MainWindow {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(0xffffff))
                             .cursor_pointer()
-                            .on_click({
-                                let assets_dir = assets_dir.clone();
-                                cx.listener(move |this, _, _, cx| {
-                                    let (filter_name, filters): (&str, &[&str]) = if is_image {
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let (filter_name, filters): (&'static str, &'static [&'static str]) =
+                                    if is_image {
                                         ("Images", &["png", "jpg", "jpeg", "gif", "webp"])
                                     } else {
                                         ("Sounds", &["mp3", "wav", "m4a", "ogg", "aac"])
                                     };
-                                    if let Some(src) = rfd::FileDialog::new()
-                                        .add_filter(filter_name, filters)
-                                        .pick_file()
-                                    {
-                                        let ext = src.extension()
-                                            .and_then(|e| e.to_str())
-                                            .unwrap_or("bin")
-                                            .to_lowercase();
-                                        let asset_id = Uuid::new_v4();
-                                        let filename = format!("{}.{}", asset_id, ext);
-                                        let dest = assets_dir.join(&filename);
-                                        if std::fs::copy(&src, &dest).is_ok() {
-                                            let name = src.file_stem()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or("Asset")
-                                                .to_string();
-                                            let asset = domain::MediaAsset {
-                                                id: asset_id,
-                                                name,
-                                                kind: if is_image { AssetKind::Image } else { AssetKind::Sound },
-                                                filename,
-                                                created_at: chrono::Utc::now(),
-                                            };
-                                            let _ = this.store.upsert_asset(&asset);
-                                            this.assets = this.store.list_assets().unwrap_or_default();
-                                            // Auto-select
-                                            if let Some(s) = image_slot {
-                                                this.form_image_ids[s] = Some(asset_id);
-                                            } else {
-                                                this.form_sound_id = Some(asset_id);
-                                            }
-                                            this.mode = Mode::Form;
-                                            cx.notify();
-                                        }
-                                    }
-                                })
-                            })
+                                // Run the native file dialog on a background thread so we never
+                                // block GPUI's render loop (blocking it triggers GPU TDR on Windows).
+                                let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(
+                                        rfd::FileDialog::new()
+                                            .add_filter(filter_name, filters)
+                                            .pick_file(),
+                                    );
+                                });
+                                this.pending_file_pick = Some((
+                                    rx,
+                                    if is_image { AssetKind::Image } else { AssetKind::Sound },
+                                    image_slot,
+                                ));
+                                cx.notify();
+                            }))
                             .child(if is_image { "Upload image\u{2026}" } else { "Upload sound\u{2026}" }),
                     ),
             )
@@ -1446,6 +1458,19 @@ impl MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Poll for background file picker result — avoids blocking GPUI's render thread.
+        if let Some((rx, kind, slot)) = self.pending_file_pick.take() {
+            match rx.try_recv() {
+                Ok(Some(src)) => self.apply_file_pick(src, kind, slot, cx),
+                Ok(None) => {} // user cancelled
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.pending_file_pick = Some((rx, kind, slot));
+                    cx.notify(); // keep polling each frame until dialog closes
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {} // thread died
+            }
+        }
+
         match self.mode.clone() {
             Mode::List => self.render_list(cx).into_any_element(),
             Mode::Form => self.render_form(cx).into_any_element(),

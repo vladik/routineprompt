@@ -4,7 +4,7 @@ use gpui::{
     div, prelude::*, px, rgb, size,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use uuid::Uuid;
 
 pub struct ReminderPopup {
@@ -15,6 +15,8 @@ pub struct ReminderPopup {
     db_path: PathBuf,
     assets_dir: PathBuf,
     assets: Vec<MediaAsset>,
+    popup_done: Arc<AtomicBool>,
+    more_pending: usize,
     // Keep alive for the duration of the popup
     _audio: Option<(rodio::OutputStream, rodio::OutputStreamHandle, rodio::Sink)>,
 }
@@ -72,7 +74,9 @@ impl Render for ReminderPopup {
             let reminder_id = self.reminder.id;
             let db_path = self.db_path.clone();
             let event_id = self.event_id;
+            let popup_done = self.popup_done.clone();
             cx.listener(move |_this, _event, window, _cx| {
+                popup_done.store(false, Ordering::Relaxed);
                 pending.lock().unwrap().remove(&reminder_id);
                 if let (Ok(store), Some(eid)) =
                     (storage::ReminderStore::open(&db_path), event_id)
@@ -82,6 +86,7 @@ impl Render for ReminderPopup {
                 window.remove_window();
             })
         };
+        let more_pending = self.more_pending;
 
         div()
             .size_full()
@@ -128,6 +133,19 @@ impl Render for ReminderPopup {
                         .text_center()
                         .px_8()
                         .child(message),
+                )
+            })
+            .when(more_pending > 0, |d| {
+                d.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x6b7280))
+                        .text_center()
+                        .child(SharedString::from(format!(
+                            "{} more reminder{} waiting",
+                            more_pending,
+                            if more_pending == 1 { "" } else { "s" }
+                        ))),
                 )
             })
             .when(!can_dismiss, |d| {
@@ -196,6 +214,8 @@ fn make_popup(
     assets_dir: PathBuf,
     assets: Vec<MediaAsset>,
     event_id: Option<Uuid>,
+    popup_done: Arc<AtomicBool>,
+    more_pending: usize,
 ) -> ReminderPopup {
     let _audio = play_sound(&reminder, &assets, &assets_dir);
     ReminderPopup {
@@ -206,6 +226,8 @@ fn make_popup(
         db_path,
         assets_dir,
         assets,
+        popup_done,
+        more_pending,
         _audio,
     }
 }
@@ -216,6 +238,8 @@ pub fn open_popup(
     pending: &PendingAcks,
     db_path: &Path,
     assets_dir: &Path,
+    popup_done: Arc<AtomicBool>,
+    more_pending: usize,
 ) {
     let assets = storage::ReminderStore::open(db_path)
         .ok()
@@ -228,13 +252,13 @@ pub fn open_popup(
 
     match reminder.display_mode {
         DisplayMode::Focus => {
-            open_focus_popup(cx, reminder, pending, db_path, assets_dir, assets, event_id)
+            open_focus_popup(cx, reminder, pending, db_path, assets_dir, assets, event_id, popup_done, more_pending)
         }
         DisplayMode::Persistent => {
-            open_persistent_popup(cx, reminder, pending, db_path, assets_dir, assets, event_id)
+            open_persistent_popup(cx, reminder, pending, db_path, assets_dir, assets, event_id, popup_done, more_pending)
         }
         DisplayMode::Gentle => {
-            open_gentle_popup(cx, reminder, pending, db_path, assets_dir, assets, event_id)
+            open_gentle_popup(cx, reminder, pending, db_path, assets_dir, assets, event_id, popup_done, more_pending)
         }
     }
 }
@@ -247,6 +271,8 @@ fn open_focus_popup(
     assets_dir: &Path,
     assets: Vec<MediaAsset>,
     event_id: Option<Uuid>,
+    popup_done: Arc<AtomicBool>,
+    more_pending: usize,
 ) {
     let reminder = reminder.clone();
     let pending = pending.clone();
@@ -254,12 +280,17 @@ fn open_focus_popup(
     let assets_dir = assets_dir.to_path_buf();
     cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Fullscreen(Bounds::default())),
+            // Fullscreen(Bounds::default()) creates a zero-size swap chain on Windows,
+            // which crashes the GPU driver (TDR → BSOD). Use a large windowed size instead.
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: gpui::Point { x: px(0.0), y: px(0.0) },
+                size: size(px(1920.0), px(1080.0)),
+            })),
             kind: gpui::WindowKind::PopUp,
             ..Default::default()
         },
         move |_, cx| {
-            cx.new(|_| make_popup(reminder, pending, db_path, assets_dir, assets, event_id))
+            cx.new(|_| make_popup(reminder, pending, db_path, assets_dir, assets, event_id, popup_done, more_pending))
         },
     )
     .ok();
@@ -273,6 +304,8 @@ fn open_persistent_popup(
     assets_dir: &Path,
     assets: Vec<MediaAsset>,
     event_id: Option<Uuid>,
+    popup_done: Arc<AtomicBool>,
+    more_pending: usize,
 ) {
     let reminder = reminder.clone();
     let pending = pending.clone();
@@ -288,7 +321,7 @@ fn open_persistent_popup(
             ..Default::default()
         },
         move |_, cx| {
-            cx.new(|_| make_popup(reminder, pending, db_path, assets_dir, assets, event_id))
+            cx.new(|_| make_popup(reminder, pending, db_path, assets_dir, assets, event_id, popup_done, more_pending))
         },
     )
     .ok();
@@ -302,6 +335,8 @@ fn open_gentle_popup(
     assets_dir: &Path,
     assets: Vec<MediaAsset>,
     event_id: Option<Uuid>,
+    popup_done: Arc<AtomicBool>,
+    more_pending: usize,
 ) {
     let reminder = reminder.clone();
     let pending = pending.clone();
@@ -317,7 +352,7 @@ fn open_gentle_popup(
             ..Default::default()
         },
         move |_, cx| {
-            cx.new(|_| make_popup(reminder, pending, db_path, assets_dir, assets, event_id))
+            cx.new(|_| make_popup(reminder, pending, db_path, assets_dir, assets, event_id, popup_done.clone(), more_pending))
         },
     );
     if let Ok(handle) = window {
@@ -326,7 +361,8 @@ fn open_gentle_popup(
                 .timer(std::time::Duration::from_secs(5))
                 .await;
             handle
-                .update(cx, |_view, window, _cx| {
+                .update(cx, |view, window, _cx| {
+                    view.popup_done.store(false, Ordering::Relaxed);
                     window.remove_window();
                 })
                 .ok();
