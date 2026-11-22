@@ -29,6 +29,7 @@ tray-icon = "0.14"
 muda      = "0.13"
 winreg    = "0.52"
 rfd       = "0.14"
+rodio     = { version = "0.19", default-features = false, features = ["mp3", "wav", "vorbis", "flac"] }
 
 # GPUI lives inside the Zed monorepo — no stable crates.io release.
 # First build will clone Zed and compile GPUI from source (~5–10 min).

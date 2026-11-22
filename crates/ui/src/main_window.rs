@@ -1,6 +1,6 @@
 use crate::text_input::TextInput;
 use chrono::{Local, NaiveTime, Timelike, Utc, Weekday};
-use domain::{DisplayMode, Reminder, Schedule};
+use domain::{AssetKind, DisplayMode, MediaAsset, Reminder, Schedule};
 use gpui::{
     App, Bounds, Context, Entity, Render, ScrollHandle, SharedString, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, rgb, size,
@@ -15,22 +15,26 @@ enum Mode {
     List,
     Form,
     Analytics,
+    Media,
+    Picker { kind: AssetKind, image_slot: Option<usize> },
 }
 
 pub struct MainWindow {
     store: ReminderStore,
     shared: Arc<Mutex<Vec<Reminder>>>,
     reminders: Vec<Reminder>,
-    images_dir: PathBuf,
+    assets: Vec<MediaAsset>,
+    assets_dir: PathBuf,
     mode: Mode,
 
     form_title: Entity<TextInput>,
-    form_image: Entity<TextInput>,
     form_hour: u8,
     form_minute: u8,
     form_days: [bool; 7],
     form_display_mode: DisplayMode,
     form_editing_id: Option<Uuid>,
+    form_image_ids: [Option<Uuid>; 3],
+    form_sound_id: Option<Uuid>,
     system_12h: bool,
     form_is_pm: bool,
     form_refire: bool,
@@ -47,24 +51,26 @@ impl MainWindow {
         store: ReminderStore,
         shared: Arc<Mutex<Vec<Reminder>>>,
         reminders: Vec<Reminder>,
-        images_dir: PathBuf,
+        assets_dir: PathBuf,
     ) -> Self {
-        let _ = std::fs::create_dir_all(&images_dir);
+        let _ = std::fs::create_dir_all(&assets_dir);
+        let assets = store.list_assets().unwrap_or_default();
         let form_title = cx.new(|cx| TextInput::new(cx, "e.g. Time for dinner"));
-        let form_image = cx.new(|cx| TextInput::new(cx, "Path to photo (optional)"));
         Self {
             store,
             shared,
             reminders,
-            images_dir,
+            assets,
+            assets_dir,
             mode: Mode::List,
             form_title,
-            form_image,
             form_hour: 8,
             form_minute: 0,
-            form_days: [true, true, true, true, true, true, true],
+            form_days: [true; 7],
             form_display_mode: DisplayMode::Persistent,
             form_editing_id: None,
+            form_image_ids: [None; 3],
+            form_sound_id: None,
             system_12h: detect_system_12h(),
             form_is_pm: false,
             form_refire: false,
@@ -86,20 +92,19 @@ impl MainWindow {
             t.value.clear();
             cx.notify();
         });
-        self.form_image.update(cx, |t, cx| {
-            t.value.clear();
-            cx.notify();
-        });
         self.form_hour = 8;
         self.form_minute = 0;
-        self.form_days = [true, true, true, true, true, true, true];
+        self.form_days = [true; 7];
         self.form_display_mode = DisplayMode::Persistent;
+        self.form_image_ids = [None; 3];
+        self.form_sound_id = None;
         self.form_is_pm = false;
         self.form_refire = false;
         self.form_refire_after_mins = 10;
         self.form_refire_until_ack = true;
         self.form_min_dismissal = false;
         self.form_min_dismissal_mins = 2;
+        self.assets = self.store.list_assets().unwrap_or_default();
         self.mode = Mode::Form;
         cx.notify();
     }
@@ -108,13 +113,8 @@ impl MainWindow {
         if let Some(r) = self.reminders.iter().find(|r| r.id == id).cloned() {
             self.form_editing_id = Some(id);
             let title = r.title.clone();
-            let image = r.image_path.clone().unwrap_or_default();
             self.form_title.update(cx, |t, cx| {
                 t.value = title;
-                cx.notify();
-            });
-            self.form_image.update(cx, |t, cx| {
-                t.value = image;
                 cx.notify();
             });
             match &r.schedule {
@@ -138,11 +138,20 @@ impl MainWindow {
                 self.form_days = [true; 7];
             }
             self.form_display_mode = r.display_mode.clone();
+            self.form_image_ids = {
+                let mut slots = [None; 3];
+                for (i, &id) in r.image_asset_ids.iter().take(3).enumerate() {
+                    slots[i] = Some(id);
+                }
+                slots
+            };
+            self.form_sound_id = r.sound_asset_id;
             self.form_refire = r.refire_after_mins.is_some();
             self.form_refire_after_mins = r.refire_after_mins.unwrap_or(10);
             self.form_refire_until_ack = r.refire_until_ack;
             self.form_min_dismissal = r.min_dismissal_mins.is_some();
             self.form_min_dismissal_mins = r.min_dismissal_mins.unwrap_or(2);
+            self.assets = self.store.list_assets().unwrap_or_default();
             self.mode = Mode::Form;
             cx.notify();
         }
@@ -153,11 +162,6 @@ impl MainWindow {
         if title.trim().is_empty() {
             return;
         }
-
-        let image_path = {
-            let p = self.form_image.read(cx).value.clone();
-            if p.is_empty() { None } else { Some(p) }
-        };
 
         let active_days: Vec<Weekday> = self.form_days
             .iter()
@@ -175,25 +179,20 @@ impl MainWindow {
             Schedule::Weekly { days: active_days, at }
         };
 
-        let refire_after_mins = if self.form_refire {
-            Some(self.form_refire_after_mins)
-        } else {
-            None
-        };
-        let min_dismissal_mins = if self.form_min_dismissal {
-            Some(self.form_min_dismissal_mins)
-        } else {
-            None
-        };
+        let refire_after_mins = if self.form_refire { Some(self.form_refire_after_mins) } else { None };
+        let min_dismissal_mins = if self.form_min_dismissal { Some(self.form_min_dismissal_mins) } else { None };
+        let image_asset_ids: Vec<Uuid> = self.form_image_ids.iter().flatten().copied().collect();
+        let sound_asset_id = self.form_sound_id;
 
         let now = Utc::now();
 
         if let Some(id) = self.form_editing_id {
             if let Some(existing) = self.reminders.iter_mut().find(|r| r.id == id) {
                 existing.title = title;
-                existing.image_path = image_path;
                 existing.schedule = schedule;
                 existing.display_mode = self.form_display_mode.clone();
+                existing.image_asset_ids = image_asset_ids;
+                existing.sound_asset_id = sound_asset_id;
                 existing.refire_after_mins = refire_after_mins;
                 existing.refire_until_ack = self.form_refire_until_ack;
                 existing.min_dismissal_mins = min_dismissal_mins;
@@ -210,8 +209,8 @@ impl MainWindow {
             id: Uuid::new_v4(),
             title,
             message: String::new(),
-            image_path,
-            sound_path: None,
+            image_asset_ids,
+            sound_asset_id,
             schedule,
             display_mode: self.form_display_mode.clone(),
             refire_after_mins,
@@ -275,6 +274,23 @@ impl MainWindow {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .child(
+                                div()
+                                    .id("media-btn")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_lg()
+                                    .bg(rgb(0xf2f2f7))
+                                    .text_sm()
+                                    .text_color(rgb(0x636366))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.assets = this.store.list_assets().unwrap_or_default();
+                                        this.mode = Mode::Media;
+                                        cx.notify();
+                                    }))
+                                    .child("Media"),
+                            )
                             .child(
                                 div()
                                     .id("analytics-btn")
@@ -423,7 +439,6 @@ impl MainWindow {
         let form_min_dismissal = self.form_min_dismissal;
         let form_min_dismissal_mins = self.form_min_dismissal_mins;
 
-        // Pre-build all listeners so none are created inside when() closures
         let ampm_handler = cx.listener(|this, _, _, cx| {
             this.form_hour = (this.form_hour + 12) % 24;
             this.form_is_pm = this.form_hour >= 12;
@@ -437,38 +452,34 @@ impl MainWindow {
             this.form_refire_until_ack = !this.form_refire_until_ack;
             cx.notify();
         });
-        let refire_5 = cx.listener(|this, _, _, cx| {
-            this.form_refire_after_mins = 5;
-            cx.notify();
-        });
-        let refire_10 = cx.listener(|this, _, _, cx| {
-            this.form_refire_after_mins = 10;
-            cx.notify();
-        });
-        let refire_30 = cx.listener(|this, _, _, cx| {
-            this.form_refire_after_mins = 30;
-            cx.notify();
-        });
+        let refire_5 = cx.listener(|this, _, _, cx| { this.form_refire_after_mins = 5; cx.notify(); });
+        let refire_10 = cx.listener(|this, _, _, cx| { this.form_refire_after_mins = 10; cx.notify(); });
+        let refire_30 = cx.listener(|this, _, _, cx| { this.form_refire_after_mins = 30; cx.notify(); });
         let dismissal_toggle = cx.listener(|this, _, _, cx| {
             this.form_min_dismissal = !this.form_min_dismissal;
             cx.notify();
         });
-        let dismissal_1 = cx.listener(|this, _, _, cx| {
-            this.form_min_dismissal_mins = 1;
-            cx.notify();
-        });
-        let dismissal_2 = cx.listener(|this, _, _, cx| {
-            this.form_min_dismissal_mins = 2;
-            cx.notify();
-        });
-        let dismissal_5 = cx.listener(|this, _, _, cx| {
-            this.form_min_dismissal_mins = 5;
-            cx.notify();
-        });
-        let dismissal_10 = cx.listener(|this, _, _, cx| {
-            this.form_min_dismissal_mins = 10;
-            cx.notify();
-        });
+        let dismissal_1 = cx.listener(|this, _, _, cx| { this.form_min_dismissal_mins = 1; cx.notify(); });
+        let dismissal_2 = cx.listener(|this, _, _, cx| { this.form_min_dismissal_mins = 2; cx.notify(); });
+        let dismissal_5 = cx.listener(|this, _, _, cx| { this.form_min_dismissal_mins = 5; cx.notify(); });
+        let dismissal_10 = cx.listener(|this, _, _, cx| { this.form_min_dismissal_mins = 10; cx.notify(); });
+
+        // Image slots
+        let img_slot_0 = self.form_image_ids[0];
+        let img_slot_1 = self.form_image_ids[1];
+        let img_slot_2 = self.form_image_ids[2];
+        let img_name_0 = img_slot_0.and_then(|id| self.assets.iter().find(|a| a.id == id).map(|a| a.name.clone()));
+        let img_name_1 = img_slot_1.and_then(|id| self.assets.iter().find(|a| a.id == id).map(|a| a.name.clone()));
+        let img_name_2 = img_slot_2.and_then(|id| self.assets.iter().find(|a| a.id == id).map(|a| a.name.clone()));
+
+        let sound_label = match self.form_sound_id {
+            Some(id) => self.assets.iter()
+                .find(|a| a.id == id)
+                .map(|a| format!("\u{1F50A} {}", a.name))
+                .unwrap_or_else(|| "\u{1F50A} Sound".into()),
+            None => "+ Add sound".into(),
+        };
+        let has_sound = self.form_sound_id.is_some();
 
         div()
             .size_full()
@@ -495,7 +506,7 @@ impl MainWindow {
                                 this.mode = Mode::List;
                                 cx.notify();
                             }))
-                            .child("← Back"),
+                            .child("\u{2190} Back"),
                     )
                     .child(
                         div()
@@ -515,7 +526,9 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    // Title
                     .child(self.render_form_section("Title", div().child(self.form_title.clone())))
+                    // Time
                     .child(self.render_form_section(
                         "Time",
                         div()
@@ -543,6 +556,7 @@ impl MainWindow {
                                 )
                             }),
                     ))
+                    // Repeat
                     .child(self.render_form_section(
                         "Repeat",
                         div()
@@ -570,6 +584,7 @@ impl MainWindow {
                                     .child(label)
                             })),
                     ))
+                    // Style
                     .child(self.render_form_section(
                         "Style",
                         div()
@@ -595,11 +610,7 @@ impl MainWindow {
                                             .border_color(rgb(0x4f46e5))
                                             .bg(if selected { rgb(0x4f46e5) } else { rgb(0xffffff) })
                                             .text_sm()
-                                            .text_color(if selected {
-                                                rgb(0xffffff)
-                                            } else {
-                                                rgb(0x4f46e5)
-                                            })
+                                            .text_color(if selected { rgb(0xffffff) } else { rgb(0x4f46e5) })
                                             .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.form_display_mode = m.clone();
@@ -609,6 +620,60 @@ impl MainWindow {
                                     }),
                             ),
                     ))
+                    // Images
+                    .child(self.render_form_section(
+                        "Images (up to 3)",
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(self.render_image_slot(0, img_slot_0, img_name_0, cx))
+                            .child(self.render_image_slot(1, img_slot_1, img_name_1, cx))
+                            .child(self.render_image_slot(2, img_slot_2, img_name_2, cx)),
+                    ))
+                    // Sound
+                    .child(self.render_form_section(
+                        "Sound",
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .id("sound-slot")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_xl()
+                                    .bg(if has_sound { rgb(0x4f46e5) } else { rgb(0xe5e5ea) })
+                                    .text_sm()
+                                    .text_color(if has_sound { rgb(0xffffff) } else { rgb(0x636366) })
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.assets = this.store.list_assets().unwrap_or_default();
+                                        this.mode = Mode::Picker { kind: AssetKind::Sound, image_slot: None };
+                                        cx.notify();
+                                    }))
+                                    .child(SharedString::from(sound_label)),
+                            )
+                            .when(has_sound, |d| {
+                                d.child(
+                                    div()
+                                        .id("sound-clear")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_lg()
+                                        .bg(rgb(0xffe5e5))
+                                        .text_sm()
+                                        .text_color(rgb(0xff3b30))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.form_sound_id = None;
+                                            cx.notify();
+                                        }))
+                                        .child("Remove"),
+                                )
+                            }),
+                    ))
+                    // If nobody responds
                     .child(self.render_form_section(
                         "If nobody responds",
                         {
@@ -630,7 +695,6 @@ impl MainWindow {
                                         .bg(rgb(0xffffff))
                                         .when(form_refire, |d| d.ml_auto()),
                                 );
-
                             div()
                                 .flex()
                                 .flex_col()
@@ -641,12 +705,7 @@ impl MainWindow {
                                         .items_center()
                                         .gap_3()
                                         .child(refire_pill)
-                                        .child(
-                                            div()
-                                                .text_base()
-                                                .text_color(rgb(0x000000))
-                                                .child("Try again if nobody responds"),
-                                        ),
+                                        .child(div().text_base().text_color(rgb(0x000000)).child("Try again if nobody responds")),
                                 )
                                 .when(form_refire, move |d| {
                                     d.child(
@@ -654,81 +713,10 @@ impl MainWindow {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x636366))
-                                                    .child("After:"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("refire-5")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_refire_after == 5 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_refire_after == 5 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(refire_5)
-                                                    .child("5 min"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("refire-10")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_refire_after == 10 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_refire_after == 10 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(refire_10)
-                                                    .child("10 min"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("refire-30")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_refire_after == 30 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_refire_after == 30 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(refire_30)
-                                                    .child("30 min"),
-                                            ),
+                                            .child(div().text_sm().text_color(rgb(0x636366)).child("After:"))
+                                            .child(self.render_pill_btn("refire-5", "5 min", form_refire_after == 5, refire_5))
+                                            .child(self.render_pill_btn("refire-10", "10 min", form_refire_after == 10, refire_10))
+                                            .child(self.render_pill_btn("refire-30", "30 min", form_refire_after == 30, refire_30)),
                                     )
                                     .child(
                                         div()
@@ -741,11 +729,7 @@ impl MainWindow {
                                                     .w(px(44.0))
                                                     .h(px(26.0))
                                                     .rounded_full()
-                                                    .bg(if form_refire_until_ack {
-                                                        rgb(0x34c759)
-                                                    } else {
-                                                        rgb(0xe5e5ea)
-                                                    })
+                                                    .bg(if form_refire_until_ack { rgb(0x34c759) } else { rgb(0xe5e5ea) })
                                                     .flex()
                                                     .items_center()
                                                     .px(px(3.0))
@@ -756,21 +740,15 @@ impl MainWindow {
                                                             .size(px(20.0))
                                                             .rounded_full()
                                                             .bg(rgb(0xffffff))
-                                                            .when(form_refire_until_ack, |d| {
-                                                                d.ml_auto()
-                                                            }),
+                                                            .when(form_refire_until_ack, |d| d.ml_auto()),
                                                     ),
                                             )
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x000000))
-                                                    .child("Keep trying until they respond"),
-                                            ),
+                                            .child(div().text_sm().text_color(rgb(0x000000)).child("Keep trying until they respond")),
                                     )
                                 })
                         },
                     ))
+                    // Dismissal
                     .child(self.render_form_section(
                         "Dismissal",
                         {
@@ -779,11 +757,7 @@ impl MainWindow {
                                 .w(px(44.0))
                                 .h(px(26.0))
                                 .rounded_full()
-                                .bg(if form_min_dismissal {
-                                    rgb(0x34c759)
-                                } else {
-                                    rgb(0xe5e5ea)
-                                })
+                                .bg(if form_min_dismissal { rgb(0x34c759) } else { rgb(0xe5e5ea) })
                                 .flex()
                                 .items_center()
                                 .px(px(3.0))
@@ -796,7 +770,6 @@ impl MainWindow {
                                         .bg(rgb(0xffffff))
                                         .when(form_min_dismissal, |d| d.ml_auto()),
                                 );
-
                             div()
                                 .flex()
                                 .flex_col()
@@ -807,12 +780,7 @@ impl MainWindow {
                                         .items_center()
                                         .gap_3()
                                         .child(dismissal_pill)
-                                        .child(
-                                            div()
-                                                .text_base()
-                                                .text_color(rgb(0x000000))
-                                                .child("Lock the OK button for a while"),
-                                        ),
+                                        .child(div().text_base().text_color(rgb(0x000000)).child("Lock the OK button for a while")),
                                 )
                                 .when(form_min_dismissal, move |d| {
                                     d.child(
@@ -820,159 +788,16 @@ impl MainWindow {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x636366))
-                                                    .child("Wait:"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("dismissal-1")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_min_dismissal_mins == 1 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_min_dismissal_mins == 1 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(dismissal_1)
-                                                    .child("1 min"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("dismissal-2")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_min_dismissal_mins == 2 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_min_dismissal_mins == 2 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(dismissal_2)
-                                                    .child("2 min"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("dismissal-5")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_min_dismissal_mins == 5 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_min_dismissal_mins == 5 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(dismissal_5)
-                                                    .child("5 min"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("dismissal-10")
-                                                    .px_3()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(rgb(0x4f46e5))
-                                                    .bg(if form_min_dismissal_mins == 10 {
-                                                        rgb(0x4f46e5)
-                                                    } else {
-                                                        rgb(0xffffff)
-                                                    })
-                                                    .text_sm()
-                                                    .text_color(if form_min_dismissal_mins == 10 {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x4f46e5)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .on_click(dismissal_10)
-                                                    .child("10 min"),
-                                            ),
+                                            .child(div().text_sm().text_color(rgb(0x636366)).child("Wait:"))
+                                            .child(self.render_pill_btn("dismissal-1", "1 min", form_min_dismissal_mins == 1, dismissal_1))
+                                            .child(self.render_pill_btn("dismissal-2", "2 min", form_min_dismissal_mins == 2, dismissal_2))
+                                            .child(self.render_pill_btn("dismissal-5", "5 min", form_min_dismissal_mins == 5, dismissal_5))
+                                            .child(self.render_pill_btn("dismissal-10", "10 min", form_min_dismissal_mins == 10, dismissal_10)),
                                     )
                                 })
                         },
                     ))
-                    .child(self.render_form_section(
-                        "Photo",
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(self.form_image.clone())
-                            .child(
-                                div()
-                                    .id("browse-btn")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(rgb(0xe5e5ea))
-                                    .text_sm()
-                                    .text_color(rgb(0x000000))
-                                    .cursor_pointer()
-                                    .on_click({
-                                        let images_dir = self.images_dir.clone();
-                                        cx.listener(move |this, _, _, cx| {
-                                            let images_dir = images_dir.clone();
-                                            if let Some(src) = rfd::FileDialog::new()
-                                                .add_filter(
-                                                    "Images",
-                                                    &["png", "jpg", "jpeg", "gif", "webp"],
-                                                )
-                                                .pick_file()
-                                            {
-                                                let ext = src
-                                                    .extension()
-                                                    .and_then(|e| e.to_str())
-                                                    .unwrap_or("jpg")
-                                                    .to_lowercase();
-                                                let filename =
-                                                    format!("{}.{}", Uuid::new_v4(), ext);
-                                                let dest = images_dir.join(&filename);
-                                                if std::fs::copy(&src, &dest).is_ok() {
-                                                    this.form_image.update(cx, |t, cx| {
-                                                        t.value = dest
-                                                            .to_string_lossy()
-                                                            .into_owned();
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            }
-                                            cx.notify();
-                                        })
-                                    })
-                                    .child("Browse…"),
-                            ),
-                    ))
+                    // Buttons
                     .child(
                         div()
                             .flex()
@@ -1021,6 +846,73 @@ impl MainWindow {
             )
     }
 
+    fn render_image_slot(
+        &self,
+        slot: usize,
+        asset_id: Option<Uuid>,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let full_path = asset_id.and_then(|id| {
+            self.assets.iter().find(|a| a.id == id).map(|a| self.assets_dir.join(&a.filename))
+        });
+        let has_image = full_path.as_ref().map_or(false, |p| p.exists());
+        let label = name.unwrap_or_else(|| "+".into());
+
+        div()
+            .id(SharedString::from(format!("img-slot-{}", slot)))
+            .w(px(90.0))
+            .h(px(90.0))
+            .rounded_xl()
+            .bg(if asset_id.is_some() { rgb(0x4f46e5) } else { rgb(0xe5e5ea) })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .overflow_hidden()
+            .text_sm()
+            .text_color(if asset_id.is_some() { rgb(0xffffff) } else { rgb(0x636366) })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.assets = this.store.list_assets().unwrap_or_default();
+                this.mode = Mode::Picker { kind: AssetKind::Image, image_slot: Some(slot) };
+                cx.notify();
+            }))
+            .when(has_image, |d| {
+                let p = full_path.clone().unwrap();
+                d.child(
+                    gpui::img(Arc::<std::path::Path>::from(p.as_path()))
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+            })
+            .when(!has_image, |d| d.child(SharedString::from(label)))
+    }
+
+    fn render_pill_btn<H>(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        selected: bool,
+        handler: H,
+    ) -> impl IntoElement
+    where
+        H: Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    {
+        div()
+            .id(id)
+            .px_3()
+            .py_1()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(0x4f46e5))
+            .bg(if selected { rgb(0x4f46e5) } else { rgb(0xffffff) })
+            .text_sm()
+            .text_color(if selected { rgb(0xffffff) } else { rgb(0x4f46e5) })
+            .cursor_pointer()
+            .on_click(handler)
+            .child(label)
+    }
+
     fn render_form_section(
         &self,
         label: &'static str,
@@ -1048,13 +940,7 @@ impl MainWindow {
     ) -> impl IntoElement {
         let max = if is_hour { 23u8 } else { 59u8 };
         let label = if is_hour && self.system_12h {
-            let display = if value == 0 {
-                12u8
-            } else if value > 12 {
-                value - 12
-            } else {
-                value
-            };
+            let display = if value == 0 { 12u8 } else if value > 12 { value - 12 } else { value };
             format!("{:02}", display)
         } else {
             format!("{:02}", value)
@@ -1085,7 +971,7 @@ impl MainWindow {
                         }
                         cx.notify();
                     }))
-                    .child("▲"),
+                    .child("\u{25B2}"),
             )
             .child(
                 div()
@@ -1123,7 +1009,345 @@ impl MainWindow {
                         }
                         cx.notify();
                     }))
-                    .child("▼"),
+                    .child("\u{25BC}"),
+            )
+    }
+
+    fn render_picker(
+        &self,
+        kind: AssetKind,
+        image_slot: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_image = kind == AssetKind::Image;
+        let title = if is_image { "Pick Image" } else { "Pick Sound" };
+        let assets: Vec<MediaAsset> = self.assets.iter()
+            .filter(|a| a.kind == kind)
+            .cloned()
+            .collect();
+
+        let assets_dir = self.assets_dir.clone();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xf2f2f7))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_3()
+                    .bg(rgb(0xffffff))
+                    .border_b_1()
+                    .border_color(rgb(0xe5e5ea))
+                    .child(
+                        div()
+                            .id("picker-back")
+                            .text_base()
+                            .text_color(rgb(0x4f46e5))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mode = Mode::Form;
+                                cx.notify();
+                            }))
+                            .child("\u{2190} Back"),
+                    )
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(0x000000))
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .child(
+                        div()
+                            .id("picker-upload")
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(rgb(0x4f46e5))
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .on_click({
+                                let assets_dir = assets_dir.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    let (filter_name, filters): (&str, &[&str]) = if is_image {
+                                        ("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                                    } else {
+                                        ("Sounds", &["mp3", "wav", "m4a", "ogg", "aac"])
+                                    };
+                                    if let Some(src) = rfd::FileDialog::new()
+                                        .add_filter(filter_name, filters)
+                                        .pick_file()
+                                    {
+                                        let ext = src.extension()
+                                            .and_then(|e| e.to_str())
+                                            .unwrap_or("bin")
+                                            .to_lowercase();
+                                        let asset_id = Uuid::new_v4();
+                                        let filename = format!("{}.{}", asset_id, ext);
+                                        let dest = assets_dir.join(&filename);
+                                        if std::fs::copy(&src, &dest).is_ok() {
+                                            let name = src.file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("Asset")
+                                                .to_string();
+                                            let asset = domain::MediaAsset {
+                                                id: asset_id,
+                                                name,
+                                                kind: if is_image { AssetKind::Image } else { AssetKind::Sound },
+                                                filename,
+                                                created_at: chrono::Utc::now(),
+                                            };
+                                            let _ = this.store.upsert_asset(&asset);
+                                            this.assets = this.store.list_assets().unwrap_or_default();
+                                            // Auto-select
+                                            if let Some(s) = image_slot {
+                                                this.form_image_ids[s] = Some(asset_id);
+                                            } else {
+                                                this.form_sound_id = Some(asset_id);
+                                            }
+                                            this.mode = Mode::Form;
+                                            cx.notify();
+                                        }
+                                    }
+                                })
+                            })
+                            .child(if is_image { "Upload image\u{2026}" } else { "Upload sound\u{2026}" }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("picker-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.form_scroll)
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .when(assets.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x8e8e93))
+                                .child(if is_image { "No images yet" } else { "No sounds yet" }),
+                        )
+                    })
+                    .children(assets.into_iter().map(|asset| {
+                        let asset_id = asset.id;
+                        let asset_name = asset.name.clone();
+                        let is_img = asset.kind == AssetKind::Image;
+                        let full_path = self.assets_dir.join(&asset.filename);
+                        let path_exists = full_path.exists();
+
+                        div()
+                            .id(SharedString::from(format!("asset-{}", asset_id)))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_4()
+                            .py_3()
+                            .bg(rgb(0xffffff))
+                            .rounded_xl()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Mode::Picker { image_slot, .. } = &this.mode {
+                                    let slot = *image_slot;
+                                    if let Some(s) = slot {
+                                        this.form_image_ids[s] = Some(asset_id);
+                                    } else {
+                                        this.form_sound_id = Some(asset_id);
+                                    }
+                                }
+                                this.mode = Mode::Form;
+                                cx.notify();
+                            }))
+                            .when(is_img && path_exists, |d| {
+                                d.child(
+                                    gpui::img(Arc::<std::path::Path>::from(full_path.as_path()))
+                                        .w(px(48.0))
+                                        .h(px(48.0))
+                                        .rounded_lg()
+                                        .object_fit(gpui::ObjectFit::Cover),
+                                )
+                            })
+                            .when(!is_img, |d| {
+                                d.child(
+                                    div()
+                                        .w(px(48.0))
+                                        .h(px(48.0))
+                                        .rounded_lg()
+                                        .bg(rgb(0xf2f2f7))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_xl()
+                                        .child("\u{1F50A}"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_base()
+                                    .text_color(rgb(0x000000))
+                                    .child(SharedString::from(asset_name)),
+                            )
+                    })),
+            )
+    }
+
+    fn render_media_library(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let assets = self.store.list_assets().unwrap_or_default();
+        let (images, sounds): (Vec<_>, Vec<_>) =
+            assets.iter().partition(|a| a.kind == AssetKind::Image);
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xf2f2f7))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_3()
+                    .bg(rgb(0xffffff))
+                    .border_b_1()
+                    .border_color(rgb(0xe5e5ea))
+                    .child(
+                        div()
+                            .id("media-back")
+                            .text_base()
+                            .text_color(rgb(0x4f46e5))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mode = Mode::List;
+                                cx.notify();
+                            }))
+                            .child("\u{2190} Back"),
+                    )
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(0x000000))
+                            .child("Media Library"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("media-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.form_scroll)
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(0x636366))
+                            .child(SharedString::from(format!("IMAGES ({})", images.len()))),
+                    )
+                    .when(images.is_empty(), |d| {
+                        d.child(div().text_sm().text_color(rgb(0x8e8e93)).child("No images"))
+                    })
+                    .children(images.into_iter().map(|asset| self.render_asset_row(asset, cx)))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(0x636366))
+                            .pt_4()
+                            .child(SharedString::from(format!("SOUNDS ({})", sounds.len()))),
+                    )
+                    .when(sounds.is_empty(), |d| {
+                        d.child(div().text_sm().text_color(rgb(0x8e8e93)).child("No sounds"))
+                    })
+                    .children(sounds.into_iter().map(|asset| self.render_asset_row(asset, cx))),
+            )
+    }
+
+    fn render_asset_row(&self, asset: &MediaAsset, cx: &mut Context<Self>) -> impl IntoElement {
+        let asset_id = asset.id;
+        let name = asset.name.clone();
+        let is_image = asset.kind == AssetKind::Image;
+        let full_path = self.assets_dir.join(&asset.filename);
+        let path_exists = full_path.exists();
+
+        div()
+            .id(SharedString::from(format!("lib-asset-{}", asset_id)))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .bg(rgb(0xffffff))
+            .rounded_xl()
+            .when(is_image && path_exists, |d| {
+                d.child(
+                    gpui::img(Arc::<std::path::Path>::from(full_path.as_path()))
+                        .w(px(48.0))
+                        .h(px(48.0))
+                        .rounded_lg()
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+            })
+            .when(!is_image, |d| {
+                d.child(
+                    div()
+                        .w(px(48.0))
+                        .h(px(48.0))
+                        .rounded_lg()
+                        .bg(rgb(0xf2f2f7))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xl()
+                        .child("\u{1F50A}"),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .text_base()
+                    .text_color(rgb(0x000000))
+                    .child(SharedString::from(name)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("lib-del-{}", asset_id)))
+                    .px_3()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(rgb(0xffe5e5))
+                    .text_sm()
+                    .text_color(rgb(0xff3b30))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(a) = this.assets.iter().find(|a| a.id == asset_id).cloned() {
+                            let _ = std::fs::remove_file(this.assets_dir.join(&a.filename));
+                        }
+                        let _ = this.store.delete_asset(asset_id);
+                        this.assets = this.store.list_assets().unwrap_or_default();
+                        cx.notify();
+                    }))
+                    .child("Delete"),
             )
     }
 
@@ -1155,7 +1379,7 @@ impl MainWindow {
                                 this.mode = Mode::List;
                                 cx.notify();
                             }))
-                            .child("← Back"),
+                            .child("\u{2190} Back"),
                     )
                     .child(
                         div()
@@ -1189,11 +1413,8 @@ impl MainWindow {
                         let status = match acked_at {
                             Some(acked) => {
                                 let secs = (acked - fired_at).num_seconds();
-                                if secs < 60 {
-                                    format!("acknowledged in {}s", secs)
-                                } else {
-                                    format!("acknowledged in {}m", secs / 60)
-                                }
+                                if secs < 60 { format!("acknowledged in {}s", secs) }
+                                else { format!("acknowledged in {}m", secs / 60) }
                             }
                             None => "not acknowledged".to_string(),
                         };
@@ -1216,10 +1437,7 @@ impl MainWindow {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x8e8e93))
-                                    .child(SharedString::from(format!(
-                                        "{} — {}",
-                                        time_str, status
-                                    ))),
+                                    .child(SharedString::from(format!("{} \u{2014} {}", time_str, status))),
                             )
                     })),
             )
@@ -1228,10 +1446,14 @@ impl MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.mode {
+        match self.mode.clone() {
             Mode::List => self.render_list(cx).into_any_element(),
             Mode::Form => self.render_form(cx).into_any_element(),
             Mode::Analytics => self.render_analytics(cx).into_any_element(),
+            Mode::Media => self.render_media_library(cx).into_any_element(),
+            Mode::Picker { kind, image_slot } => {
+                self.render_picker(kind, image_slot, cx).into_any_element()
+            }
         }
     }
 }
@@ -1252,36 +1474,24 @@ fn schedule_display(s: &Schedule) -> String {
 
 fn weekday_short(d: Weekday) -> &'static str {
     match d {
-        Weekday::Mon => "Mon",
-        Weekday::Tue => "Tue",
-        Weekday::Wed => "Wed",
-        Weekday::Thu => "Thu",
-        Weekday::Fri => "Fri",
-        Weekday::Sat => "Sat",
+        Weekday::Mon => "Mon", Weekday::Tue => "Tue", Weekday::Wed => "Wed",
+        Weekday::Thu => "Thu", Weekday::Fri => "Fri", Weekday::Sat => "Sat",
         Weekday::Sun => "Sun",
     }
 }
 
 fn weekday_idx(d: Weekday) -> usize {
     match d {
-        Weekday::Mon => 0,
-        Weekday::Tue => 1,
-        Weekday::Wed => 2,
-        Weekday::Thu => 3,
-        Weekday::Fri => 4,
-        Weekday::Sat => 5,
+        Weekday::Mon => 0, Weekday::Tue => 1, Weekday::Wed => 2,
+        Weekday::Thu => 3, Weekday::Fri => 4, Weekday::Sat => 5,
         Weekday::Sun => 6,
     }
 }
 
 fn idx_weekday(i: usize) -> Weekday {
     match i {
-        0 => Weekday::Mon,
-        1 => Weekday::Tue,
-        2 => Weekday::Wed,
-        3 => Weekday::Thu,
-        4 => Weekday::Fri,
-        5 => Weekday::Sat,
+        0 => Weekday::Mon, 1 => Weekday::Tue, 2 => Weekday::Wed,
+        3 => Weekday::Thu, 4 => Weekday::Fri, 5 => Weekday::Sat,
         _ => Weekday::Sun,
     }
 }
@@ -1292,7 +1502,6 @@ fn detect_system_12h() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok(intl) = hkcu.open_subkey(r"Control Panel\International") {
         if let Ok(fmt) = intl.get_value::<String, _>("sTimeFormat") {
-            // Windows: 'h' = 12-hour, 'H' = 24-hour
             return fmt.contains('h') || fmt.contains('t');
         }
     }
@@ -1319,11 +1528,11 @@ pub fn open_main_window(
         move |_, cx| {
             let store = storage::ReminderStore::open(&db_path).expect("open db");
             let reminders = store.list().unwrap_or_default();
-            let images_dir = db_path
+            let assets_dir = db_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
-                .join("images");
-            cx.new(|cx| MainWindow::new(cx, store, shared, reminders, images_dir))
+                .join("assets");
+            cx.new(|cx| MainWindow::new(cx, store, shared, reminders, assets_dir))
         },
     )
     .ok();

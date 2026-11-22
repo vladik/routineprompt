@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveTime, Utc, Weekday};
-use domain::{DisplayMode, Reminder, Schedule};
+use domain::{DisplayMode, MediaAsset, Reminder, Schedule};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use uuid::Uuid;
@@ -42,9 +42,16 @@ impl ReminderStore {
                 reminder_id     TEXT NOT NULL,
                 fired_at        TEXT NOT NULL,
                 acknowledged_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS media_assets (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                filename   TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );",
         )?;
-        // Safe migrations for existing databases — ignore errors if column already exists
+        // Safe migrations — ignore errors if column already exists
         let _ = self.conn.execute_batch(
             "ALTER TABLE reminders ADD COLUMN refire_after_mins INTEGER",
         );
@@ -54,15 +61,22 @@ impl ReminderStore {
         let _ = self.conn.execute_batch(
             "ALTER TABLE reminders ADD COLUMN min_dismissal_mins INTEGER",
         );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE reminders ADD COLUMN image_asset_ids TEXT NOT NULL DEFAULT '[]'",
+        );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE reminders ADD COLUMN sound_asset_id TEXT",
+        );
         Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<Reminder>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, message, image_path, sound_path,
+            "SELECT id, title, message,
                     sched_type, sched_time, sched_days,
                     display_mode, enabled, created_at, updated_at,
-                    refire_after_mins, refire_until_ack, min_dismissal_mins
+                    refire_after_mins, refire_until_ack, min_dismissal_mins,
+                    image_asset_ids, sound_asset_id
              FROM reminders ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -70,37 +84,41 @@ impl ReminderStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, bool>(7)?,
                 row.get::<_, String>(8)?,
-                row.get::<_, bool>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<u8>>(10)?,
+                row.get::<_, bool>(11)?,
                 row.get::<_, Option<u8>>(12)?,
-                row.get::<_, bool>(13)?,
-                row.get::<_, Option<u8>>(14)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, Option<String>>(14)?,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, title, message, image_path, sound_path,
+            let (id, title, message,
                  sched_type, sched_time, sched_days,
                  display_mode_str, enabled, created_at, updated_at,
-                 refire_after_mins, refire_until_ack, min_dismissal_mins) = row?;
+                 refire_after_mins, refire_until_ack, min_dismissal_mins,
+                 image_asset_ids_str, sound_asset_id_str) = row?;
 
             let schedule = parse_schedule(&sched_type, &sched_time, sched_days.as_deref())?;
             let display_mode = parse_display_mode(&display_mode_str);
+            let image_asset_ids: Vec<Uuid> = serde_json::from_str(&image_asset_ids_str)
+                .unwrap_or_default();
+            let sound_asset_id = sound_asset_id_str.and_then(|s| s.parse().ok());
 
             out.push(Reminder {
                 id: Uuid::parse_str(&id)?,
                 title,
                 message,
-                image_path,
-                sound_path,
+                image_asset_ids,
+                sound_asset_id,
                 schedule,
                 display_mode,
                 refire_after_mins,
@@ -116,30 +134,35 @@ impl ReminderStore {
 
     pub fn upsert(&self, r: &Reminder) -> Result<()> {
         let (sched_type, sched_time, sched_days) = encode_schedule(&r.schedule);
+        let image_asset_ids_str = serde_json::to_string(&r.image_asset_ids)
+            .unwrap_or_else(|_| "[]".into());
         self.conn.execute(
             "INSERT INTO reminders
-                (id, title, message, image_path, sound_path,
+                (id, title, message,
                  sched_type, sched_time, sched_days,
                  display_mode, refire_after_mins, refire_until_ack, min_dismissal_mins,
+                 image_asset_ids, sound_asset_id,
                  enabled, created_at, updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, message=excluded.message,
-                image_path=excluded.image_path, sound_path=excluded.sound_path,
                 sched_type=excluded.sched_type, sched_time=excluded.sched_time,
                 sched_days=excluded.sched_days, display_mode=excluded.display_mode,
                 refire_after_mins=excluded.refire_after_mins,
                 refire_until_ack=excluded.refire_until_ack,
                 min_dismissal_mins=excluded.min_dismissal_mins,
+                image_asset_ids=excluded.image_asset_ids,
+                sound_asset_id=excluded.sound_asset_id,
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
             params![
                 r.id.to_string(), r.title, r.message,
-                r.image_path, r.sound_path,
                 sched_type, sched_time, sched_days,
                 encode_display_mode(&r.display_mode),
                 r.refire_after_mins,
                 r.refire_until_ack as i32,
                 r.min_dismissal_mins,
+                image_asset_ids_str,
+                r.sound_asset_id.map(|id| id.to_string()),
                 r.enabled,
                 r.created_at.to_rfc3339(),
                 r.updated_at.to_rfc3339(),
@@ -208,6 +231,57 @@ impl ReminderStore {
             ));
         }
         Ok(out)
+    }
+
+    // ── Media assets ──────────────────────────────────────────────────────────
+
+    pub fn list_assets(&self) -> Result<Vec<MediaAsset>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, kind, filename, created_at
+             FROM media_assets ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, kind, filename, created_at) = row?;
+            out.push(MediaAsset {
+                id: id.parse()?,
+                name,
+                kind: domain::AssetKind::from_str(&kind),
+                filename,
+                created_at: created_at.parse::<DateTime<Utc>>()?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_asset(&self, asset: &MediaAsset) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO media_assets (id, name, kind, filename, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            params![
+                asset.id.to_string(),
+                asset.name,
+                asset.kind.as_str(),
+                asset.filename,
+                asset.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_asset(&self, id: Uuid) -> Result<()> {
+        self.conn.execute("DELETE FROM media_assets WHERE id=?1", [id.to_string()])?;
+        Ok(())
     }
 }
 

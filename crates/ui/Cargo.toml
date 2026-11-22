@@ -12,3 +12,4 @@ uuid    = { workspace = true }
 winreg  = { workspace = true }
 rfd     = { workspace = true }
 dirs    = { workspace = true }
+rodio   = { workspace = true }

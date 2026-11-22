@@ -51,8 +51,11 @@ fn main() -> anyhow::Result<()> {
                     while let Ok(reminder) = sched_rx.try_recv() {
                         let p = pending_spawn.clone();
                         let db = db_path_spawn.clone();
+                        let assets = db.parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join("assets");
                         cx.update(|cx| {
-                            ui::popup::open_popup(cx, &reminder, &p, &db);
+                            ui::popup::open_popup(cx, &reminder, &p, &db, &assets);
                         });
                     }
 
