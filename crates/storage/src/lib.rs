@@ -36,8 +36,24 @@ impl ReminderStore {
                 enabled      INTEGER NOT NULL DEFAULT 1,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reminder_events (
+                id              TEXT PRIMARY KEY,
+                reminder_id     TEXT NOT NULL,
+                fired_at        TEXT NOT NULL,
+                acknowledged_at TEXT
             );",
         )?;
+        // Safe migrations for existing databases — ignore errors if column already exists
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE reminders ADD COLUMN refire_after_mins INTEGER",
+        );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE reminders ADD COLUMN refire_until_ack INTEGER NOT NULL DEFAULT 0",
+        );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE reminders ADD COLUMN min_dismissal_mins INTEGER",
+        );
         Ok(())
     }
 
@@ -45,7 +61,8 @@ impl ReminderStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, message, image_path, sound_path,
                     sched_type, sched_time, sched_days,
-                    display_mode, enabled, created_at, updated_at
+                    display_mode, enabled, created_at, updated_at,
+                    refire_after_mins, refire_until_ack, min_dismissal_mins
              FROM reminders ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -62,6 +79,9 @@ impl ReminderStore {
                 row.get::<_, bool>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
+                row.get::<_, Option<u8>>(12)?,
+                row.get::<_, bool>(13)?,
+                row.get::<_, Option<u8>>(14)?,
             ))
         })?;
 
@@ -69,7 +89,8 @@ impl ReminderStore {
         for row in rows {
             let (id, title, message, image_path, sound_path,
                  sched_type, sched_time, sched_days,
-                 display_mode_str, enabled, created_at, updated_at) = row?;
+                 display_mode_str, enabled, created_at, updated_at,
+                 refire_after_mins, refire_until_ack, min_dismissal_mins) = row?;
 
             let schedule = parse_schedule(&sched_type, &sched_time, sched_days.as_deref())?;
             let display_mode = parse_display_mode(&display_mode_str);
@@ -82,6 +103,9 @@ impl ReminderStore {
                 sound_path,
                 schedule,
                 display_mode,
+                refire_after_mins,
+                refire_until_ack,
+                min_dismissal_mins,
                 enabled,
                 created_at: created_at.parse::<DateTime<Utc>>()?,
                 updated_at: updated_at.parse::<DateTime<Utc>>()?,
@@ -96,19 +120,26 @@ impl ReminderStore {
             "INSERT INTO reminders
                 (id, title, message, image_path, sound_path,
                  sched_type, sched_time, sched_days,
-                 display_mode, enabled, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                 display_mode, refire_after_mins, refire_until_ack, min_dismissal_mins,
+                 enabled, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, message=excluded.message,
                 image_path=excluded.image_path, sound_path=excluded.sound_path,
                 sched_type=excluded.sched_type, sched_time=excluded.sched_time,
                 sched_days=excluded.sched_days, display_mode=excluded.display_mode,
+                refire_after_mins=excluded.refire_after_mins,
+                refire_until_ack=excluded.refire_until_ack,
+                min_dismissal_mins=excluded.min_dismissal_mins,
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
             params![
                 r.id.to_string(), r.title, r.message,
                 r.image_path, r.sound_path,
                 sched_type, sched_time, sched_days,
                 encode_display_mode(&r.display_mode),
+                r.refire_after_mins,
+                r.refire_until_ack as i32,
+                r.min_dismissal_mins,
                 r.enabled,
                 r.created_at.to_rfc3339(),
                 r.updated_at.to_rfc3339(),
@@ -129,6 +160,55 @@ impl ReminderStore {
         )?;
         Ok(())
     }
+
+    pub fn log_fired(&self, reminder_id: Uuid) -> Result<Uuid> {
+        let event_id = Uuid::new_v4();
+        self.conn.execute(
+            "INSERT INTO reminder_events (id, reminder_id, fired_at) VALUES (?1, ?2, ?3)",
+            params![
+                event_id.to_string(),
+                reminder_id.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(event_id)
+    }
+
+    pub fn log_acknowledged(&self, event_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "UPDATE reminder_events SET acknowledged_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), event_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_events(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.title, e.fired_at, e.acknowledged_at
+             FROM reminder_events e JOIN reminders r ON e.reminder_id = r.id
+             ORDER BY e.fired_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (title, fired, acked) = row?;
+            out.push((
+                title,
+                fired.parse::<DateTime<Utc>>()?,
+                acked.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+            ));
+        }
+        Ok(out)
+    }
 }
 
 fn encode_schedule(s: &Schedule) -> (String, String, Option<String>) {
@@ -136,7 +216,11 @@ fn encode_schedule(s: &Schedule) -> (String, String, Option<String>) {
         Schedule::Once { at } => ("once".into(), at.to_rfc3339(), None),
         Schedule::Daily { at } => ("daily".into(), at.format("%H:%M").to_string(), None),
         Schedule::Weekly { days, at } => {
-            let days_str = days.iter().map(|d| weekday_to_num(d).to_string()).collect::<Vec<_>>().join(",");
+            let days_str = days
+                .iter()
+                .map(|d| weekday_to_num(d).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             ("weekly".into(), at.format("%H:%M").to_string(), Some(days_str))
         }
     }
@@ -147,7 +231,9 @@ fn parse_schedule(sched_type: &str, sched_time: &str, sched_days: Option<&str>) 
         "once" => Ok(Schedule::Once { at: sched_time.parse::<DateTime<Utc>>()? }),
         "daily" => Ok(Schedule::Daily { at: NaiveTime::parse_from_str(sched_time, "%H:%M")? }),
         "weekly" => {
-            let days = sched_days.unwrap_or("").split(',')
+            let days = sched_days
+                .unwrap_or("")
+                .split(',')
                 .filter_map(|n| n.parse::<u8>().ok())
                 .filter_map(num_to_weekday)
                 .collect();
@@ -178,15 +264,25 @@ fn parse_display_mode(s: &str) -> DisplayMode {
 
 fn weekday_to_num(d: &Weekday) -> u8 {
     match d {
-        Weekday::Mon => 0, Weekday::Tue => 1, Weekday::Wed => 2,
-        Weekday::Thu => 3, Weekday::Fri => 4, Weekday::Sat => 5, Weekday::Sun => 6,
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
     }
 }
 
 fn num_to_weekday(n: u8) -> Option<Weekday> {
     match n {
-        0 => Some(Weekday::Mon), 1 => Some(Weekday::Tue), 2 => Some(Weekday::Wed),
-        3 => Some(Weekday::Thu), 4 => Some(Weekday::Fri), 5 => Some(Weekday::Sat),
-        6 => Some(Weekday::Sun), _ => None,
+        0 => Some(Weekday::Mon),
+        1 => Some(Weekday::Tue),
+        2 => Some(Weekday::Wed),
+        3 => Some(Weekday::Thu),
+        4 => Some(Weekday::Fri),
+        5 => Some(Weekday::Sat),
+        6 => Some(Weekday::Sun),
+        _ => None,
     }
 }

@@ -1,15 +1,16 @@
 use chrono::{Datelike, Local, NaiveTime, Timelike, Weekday};
-use domain::{Reminder, Schedule};
+use domain::{PendingAcks, Reminder, Schedule};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct Scheduler {
     reminders: Arc<Mutex<Vec<Reminder>>>,
+    pending: PendingAcks,
 }
 
 impl Scheduler {
-    pub fn new(reminders: Arc<Mutex<Vec<Reminder>>>) -> Self {
-        Self { reminders }
+    pub fn new(reminders: Arc<Mutex<Vec<Reminder>>>, pending: PendingAcks) -> Self {
+        Self { reminders, pending }
     }
 
     pub fn start(self, tx: std::sync::mpsc::Sender<Reminder>) {
@@ -19,17 +20,52 @@ impl Scheduler {
                 let now = Local::now();
                 let current_minute = (now.hour(), now.minute());
 
+                // Normal scheduled firing — once per new minute
                 if last_fired_minute != Some(current_minute) {
                     last_fired_minute = Some(current_minute);
                     let reminders = self.reminders.lock().unwrap().clone();
-                    for reminder in reminders {
+                    for reminder in &reminders {
                         if reminder.enabled && is_due(&reminder.schedule, now) {
-                            let _ = tx.send(reminder);
+                            let _ = tx.send(reminder.clone());
+                            if reminder.refire_after_mins.is_some() {
+                                self.pending
+                                    .lock()
+                                    .unwrap()
+                                    .insert(reminder.id, std::time::Instant::now());
+                            }
                         }
                     }
                 }
 
-                // Sleep until the next minute, checking every 10s to avoid drift
+                // Re-fire unacknowledged reminders
+                {
+                    let now_instant = std::time::Instant::now();
+                    let pending_snapshot: Vec<(uuid::Uuid, std::time::Instant)> = self
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| (*k, *v))
+                        .collect();
+                    let reminders = self.reminders.lock().unwrap().clone();
+                    for (id, last_fire) in pending_snapshot {
+                        if let Some(reminder) =
+                            reminders.iter().find(|r| r.id == id && r.enabled)
+                        {
+                            if let Some(refire_mins) = reminder.refire_after_mins {
+                                let elapsed = now_instant.duration_since(last_fire).as_secs();
+                                if elapsed >= refire_mins as u64 * 60 {
+                                    let _ = tx.send(reminder.clone());
+                                    self.pending
+                                        .lock()
+                                        .unwrap()
+                                        .insert(id, now_instant);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let secs_into_minute = now.second();
                 let secs_to_next = if secs_into_minute < 55 {
                     10

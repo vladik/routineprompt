@@ -1,7 +1,8 @@
-use domain::Reminder;
+use domain::{PendingAcks, Reminder};
 use gpui::{App, QuitMode, SharedString};
 use muda::{Menu, MenuEvent, MenuItem};
 use scheduler::Scheduler;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use tray_icon::{TrayIconBuilder, TrayIconEvent, MouseButton};
 use ui::main_window::open_main_window;
@@ -19,11 +20,13 @@ fn main() -> anyhow::Result<()> {
     drop(store);
 
     let shared: Arc<Mutex<Vec<Reminder>>> = Arc::new(Mutex::new(initial_reminders));
+    let pending: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
     let (sched_tx, sched_rx) = mpsc::channel::<Reminder>();
-    Scheduler::new(shared.clone()).start(sched_tx);
+    Scheduler::new(shared.clone(), pending.clone()).start(sched_tx);
 
     let _tray = build_tray_icon();
 
+    let pending_for_app = pending.clone();
     let shared_for_app = shared.clone();
     let db_path_for_app = db_path.clone();
 
@@ -36,6 +39,8 @@ fn main() -> anyhow::Result<()> {
             open_main_window(cx, shared_for_window.clone(), db_path_for_window.clone());
 
             let shared_poll = shared_for_app.clone();
+            let pending_spawn = pending_for_app.clone();
+            let db_path_spawn = db_path_for_app.clone();
             cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor()
@@ -44,8 +49,10 @@ fn main() -> anyhow::Result<()> {
 
                     // Fire due reminders as popups
                     while let Ok(reminder) = sched_rx.try_recv() {
+                        let p = pending_spawn.clone();
+                        let db = db_path_spawn.clone();
                         cx.update(|cx| {
-                            ui::popup::open_popup(cx, &reminder);
+                            ui::popup::open_popup(cx, &reminder, &p, &db);
                         });
                     }
 

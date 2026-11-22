@@ -9,3 +9,4 @@ storage = { workspace = true }
 gpui    = { workspace = true }
 chrono  = { workspace = true }
 uuid    = { workspace = true }
+winreg  = { workspace = true }

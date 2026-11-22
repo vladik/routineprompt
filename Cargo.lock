@@ -4513,6 +4513,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "domain",
+ "uuid",
 ]
 
 [[package]]
@@ -5416,6 +5417,7 @@ dependencies = [
  "gpui",
  "storage",
  "uuid",
+ "winreg 0.52.0",
 ]
 
 [[package]]
