@@ -1,0 +1,11 @@
+[package]
+name    = "ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain  = { workspace = true }
+storage = { workspace = true }
+gpui    = { workspace = true }
+chrono  = { workspace = true }
+uuid    = { workspace = true }

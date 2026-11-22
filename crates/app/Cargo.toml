@@ -1,0 +1,22 @@
+[package]
+name    = "routineprompt"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "routineprompt"
+path = "src/main.rs"
+
+[dependencies]
+domain        = { workspace = true }
+storage       = { workspace = true }
+scheduler     = { workspace = true }
+ui            = { workspace = true }
+gpui          = { workspace = true }
+gpui_platform = { workspace = true }
+chrono        = { workspace = true }
+anyhow        = { workspace = true }
+dirs          = { workspace = true }
+tray-icon     = { workspace = true }
+muda          = { workspace = true }
+winreg        = { workspace = true }
