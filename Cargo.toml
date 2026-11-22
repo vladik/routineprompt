@@ -3,36 +3,17 @@ members = [
     "crates/domain",
     "crates/storage",
     "crates/scheduler",
-    "crates/ui",
-    "crates/app",
+    "src-tauri",
 ]
 resolver = "2"
 
-# Declare shared dependencies once here.
-# Each crate opts in with `{ workspace = true }` — no version drift possible.
 [workspace.dependencies]
 domain    = { path = "crates/domain" }
-storage   = { path = "crates/storage" }
-scheduler = { path = "crates/scheduler" }
-ui        = { path = "crates/ui" }
 
 uuid     = { version = "1", features = ["v4", "serde"] }
 chrono   = { version = "0.4", features = ["serde"] }
 serde    = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
-tokio    = { version = "1", features = ["full"] }
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow    = "1"
 dirs      = "5"
-tray-icon = "0.14"
-muda      = "0.13"
 winreg    = "0.52"
-rfd       = "0.14"
-rodio     = { version = "0.19", default-features = false, features = ["mp3", "wav", "vorbis", "flac"] }
-
-# GPUI lives inside the Zed monorepo — no stable crates.io release.
-# First build will clone Zed and compile GPUI from source (~5–10 min).
-# Pin to a specific commit once you find a working one.
-gpui          = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c" }
