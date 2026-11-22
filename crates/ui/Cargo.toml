@@ -10,3 +10,5 @@ gpui    = { workspace = true }
 chrono  = { workspace = true }
 uuid    = { workspace = true }
 winreg  = { workspace = true }
+rfd     = { workspace = true }
+dirs    = { workspace = true }

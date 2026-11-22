@@ -5,6 +5,7 @@ use gpui::{
     App, Bounds, Context, Entity, Render, ScrollHandle, SharedString, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, rgb, size,
 };
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use storage::ReminderStore;
 use uuid::Uuid;
@@ -20,6 +21,7 @@ pub struct MainWindow {
     store: ReminderStore,
     shared: Arc<Mutex<Vec<Reminder>>>,
     reminders: Vec<Reminder>,
+    images_dir: PathBuf,
     mode: Mode,
 
     form_title: Entity<TextInput>,
@@ -45,13 +47,16 @@ impl MainWindow {
         store: ReminderStore,
         shared: Arc<Mutex<Vec<Reminder>>>,
         reminders: Vec<Reminder>,
+        images_dir: PathBuf,
     ) -> Self {
+        let _ = std::fs::create_dir_all(&images_dir);
         let form_title = cx.new(|cx| TextInput::new(cx, "e.g. Time for dinner"));
         let form_image = cx.new(|cx| TextInput::new(cx, "Path to photo (optional)"));
         Self {
             store,
             shared,
             reminders,
+            images_dir,
             mode: Mode::List,
             form_title,
             form_image,
@@ -917,7 +922,57 @@ impl MainWindow {
                                 })
                         },
                     ))
-                    .child(self.render_form_section("Photo", div().child(self.form_image.clone())))
+                    .child(self.render_form_section(
+                        "Photo",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(self.form_image.clone())
+                            .child(
+                                div()
+                                    .id("browse-btn")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(rgb(0xe5e5ea))
+                                    .text_sm()
+                                    .text_color(rgb(0x000000))
+                                    .cursor_pointer()
+                                    .on_click({
+                                        let images_dir = self.images_dir.clone();
+                                        cx.listener(move |this, _, _, cx| {
+                                            let images_dir = images_dir.clone();
+                                            if let Some(src) = rfd::FileDialog::new()
+                                                .add_filter(
+                                                    "Images",
+                                                    &["png", "jpg", "jpeg", "gif", "webp"],
+                                                )
+                                                .pick_file()
+                                            {
+                                                let ext = src
+                                                    .extension()
+                                                    .and_then(|e| e.to_str())
+                                                    .unwrap_or("jpg")
+                                                    .to_lowercase();
+                                                let filename =
+                                                    format!("{}.{}", Uuid::new_v4(), ext);
+                                                let dest = images_dir.join(&filename);
+                                                if std::fs::copy(&src, &dest).is_ok() {
+                                                    this.form_image.update(cx, |t, cx| {
+                                                        t.value = dest
+                                                            .to_string_lossy()
+                                                            .into_owned();
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }
+                                            cx.notify();
+                                        })
+                                    })
+                                    .child("Browse…"),
+                            ),
+                    ))
                     .child(
                         div()
                             .flex()
@@ -1264,7 +1319,11 @@ pub fn open_main_window(
         move |_, cx| {
             let store = storage::ReminderStore::open(&db_path).expect("open db");
             let reminders = store.list().unwrap_or_default();
-            cx.new(|cx| MainWindow::new(cx, store, shared, reminders))
+            let images_dir = db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("images");
+            cx.new(|cx| MainWindow::new(cx, store, shared, reminders, images_dir))
         },
     )
     .ok();
